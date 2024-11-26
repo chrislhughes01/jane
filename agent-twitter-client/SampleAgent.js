@@ -1,10 +1,24 @@
-import { Scraper } from 'agent-twitter-client';
+import { TwitterApi } from 'twitter-api-v2';
 import dotenv from 'dotenv';
 import OpenAI from 'openai';
+import axios from 'axios';
+import fs from 'fs';
 
 dotenv.config();
 
 const MAX_RUNTIME = 30 * 60 * 1000; // 30 minutes in milliseconds
+const IMAGE_PATH = './generated_image.png'; // Path to save the generated image
+
+// Initialize OpenAI
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+// Initialize Twitter Client
+const twitterClient = new TwitterApi({
+  appKey: process.env.TWITTER_API_KEY,
+  appSecret: process.env.TWITTER_API_SECRET_KEY,
+  accessToken: process.env.TWITTER_ACCESS_TOKEN,
+  accessSecret: process.env.TWITTER_ACCESS_TOKEN_SECRET,
+});
 
 // Sample tweets to simulate training
 const TRAINING_TWEETS = [
@@ -15,8 +29,8 @@ const TRAINING_TWEETS = [
   "Ecosystems, primates, and preservation—they’re not just data points, they’re a calling. Together, we can make a difference."
 ];
 
-// Generate a tweet inspired by the training data
-async function generateDynamicTweet(openai) {
+// Generate a text tweet inspired by training data
+async function generateDynamicTweet() {
   const trainingText = TRAINING_TWEETS.join("\n");
   const prompt = `
 Based on the following tweets, generate a new creative and engaging monkey- or conservation-themed tweet in the voice of "Jane," a humorous yet purpose-driven AI:
@@ -48,64 +62,96 @@ Generated tweet:
   }
 }
 
-// Post a tweet at random intervals, with rate limit handling
-async function postTweet(scraper, openai) {
-  const tweet = await generateDynamicTweet(openai);
+// Generate an image using OpenAI's DALL·E
+async function generateImage(prompt) {
+  console.log(`Generating image with prompt: ${prompt}`);
   try {
-    await scraper.sendTweetV2(tweet);
-    console.log(`Tweet posted successfully: ${tweet}`);
-  } catch (error) {
-    if (error.code === 429) { // Handle rate limit exceeded
-      const resetTime = error.rateLimit?.reset || Date.now() + 15 * 60 * 1000; // Default to 15 minutes
-      const delay = resetTime * 1000 - Date.now();
-      console.warn(`Rate limit exceeded. Retrying after ${new Date(resetTime * 1000)}.`);
-      if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
-    } else {
-      console.error("Error posting tweet:", error.response?.data || error.message);
+    const response = await openai.images.generate({
+      prompt,
+      n: 1,
+      size: "512x512",
+    });
+
+    const imageUrl = response.data?.[0]?.url;
+    if (!imageUrl) {
+      console.error('No image URL found in the response.');
+      return null;
     }
+
+    console.log(`Generated image URL: ${imageUrl}`);
+    return imageUrl;
+  } catch (error) {
+    console.error('Error generating image:', error);
+    return null;
   }
 }
 
-// Introduce random delays
-async function randomDelay(min, max) {
-  const delay = Math.floor(Math.random() * (max - min + 1) + min) * 60 * 1000; // Convert to ms
-  console.log(`Waiting for ${delay / 1000 / 60} minutes before the next tweet...`);
-  return new Promise((resolve) => setTimeout(resolve, delay));
+// Download an image to disk
+async function downloadImage(imageUrl, outputPath) {
+  try {
+    const response = await axios.get(imageUrl, { responseType: 'arraybuffer' });
+    fs.writeFileSync(outputPath, response.data);
+    console.log(`Image saved to ${outputPath}`);
+    return true;
+  } catch (error) {
+    console.error('Error downloading image:', error);
+    return false;
+  }
 }
 
-// Main function to run the bot
+// Upload media to Twitter and post a tweet with it
+async function postImageTweet(tweet, imagePath) {
+  try {
+    // Upload the image to Twitter
+    const mediaId = await twitterClient.v1.uploadMedia(imagePath);
+    console.log(`Media uploaded with ID: ${mediaId}`);
+
+    // Post the tweet with the media
+    await twitterClient.v2.tweet({
+      text: tweet,
+      media: { media_ids: [mediaId] },
+    });
+    console.log(`Tweet posted with image: ${tweet}`);
+  } catch (error) {
+    console.error('Error posting tweet with image:', error);
+  }
+}
+
+// Post a tweet with a 10% chance of including an image
+async function postTweet() {
+  const tweet = await generateDynamicTweet();
+  const includeImage = Math.random() < 0.1; // 10% chance to include an image
+
+  if (includeImage) {
+    const imagePrompt = "A playful monkey swinging on a tree in a lush rainforest, digital art style";
+    const imageUrl = await generateImage(imagePrompt);
+
+    if (imageUrl) {
+      const success = await downloadImage(imageUrl, IMAGE_PATH);
+      if (success) {
+        await postImageTweet(tweet, IMAGE_PATH);
+        fs.unlinkSync(IMAGE_PATH); // Clean up image file after posting
+      }
+    } else {
+      console.warn("Image generation failed. Posting text-only tweet.");
+      await twitterClient.v2.tweet({ text: tweet });
+    }
+  } else {
+    // Post a text-only tweet
+    await twitterClient.v2.tweet({ text: tweet });
+    console.log(`Text-only tweet posted: ${tweet}`);
+  }
+}
+
+// Main function to generate and post tweets
 async function main() {
-  const scraper = new Scraper();
-  const openai = new OpenAI({
-    apiKey: process.env.OPENAI_API_KEY
-  });
-
-  console.log('Logging in...');
-  await scraper.login(
-    process.env.TWITTER_USERNAME,
-    process.env.TWITTER_PASSWORD,
-    process.env.TWITTER_EMAIL,
-  );
-  console.log('Logged in successfully!: v1');
-
-  console.log('Logging in to Twitter API v2...');
-  await scraper.login(
-    process.env.TWITTER_USERNAME,
-    process.env.TWITTER_PASSWORD,
-    process.env.TWITTER_EMAIL,
-    undefined, // twoFactorSecret
-    process.env.TWITTER_API_KEY,
-    process.env.TWITTER_API_SECRET_KEY,
-    process.env.TWITTER_ACCESS_TOKEN,
-    process.env.TWITTER_ACCESS_TOKEN_SECRET
-  );
-  console.log('Logged in successfully (v2)');
-
   const startTime = Date.now();
 
   while (Date.now() - startTime < MAX_RUNTIME) {
-    await postTweet(scraper, openai);
-    await randomDelay(5, 15); // Wait between 5 to 15 minutes before the next tweet
+    await postTweet();
+    const delay = Math.floor(Math.random() * (15 - 5 + 1) + 5) * 60 * 1000; // Random delay between 5 and 15 minutes
+    console.log(`Waiting ${delay / 1000 / 60} minutes before the next tweet.`);
+    await new Promise(resolve => setTimeout(resolve, delay));
   }
 
   console.log("30 minutes elapsed. Stopping the bot.");
